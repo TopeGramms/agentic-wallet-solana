@@ -1,0 +1,28 @@
+{
+  "name": "agentic-wallet-solana",
+  "version": "1.0.0",
+  "description": "Agentic Wallets for AI Agents on Solana - Superteam Nigeria Bounty",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/index.ts",
+    "test": "ts-node tests/test.ts",
+    "dev": "ts-node-dev src/index.ts"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.4",
+    "@solana/spl-token": "^0.4.9",
+    "anthropic": "^0.36.3",
+    "dotenv": "^16.4.7",
+    "bs58": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "typescript": "^5.7.3",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0"
+  },
+  "keywords": ["solana", "agentic-wallet", "ai-agent", "defi", "web3"],
+  "author": "",
+  "license": "MIT"
+}
