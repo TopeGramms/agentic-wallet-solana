@@ -1,5 +1,12 @@
 import TelegramBot from "node-telegram-bot-api";
-import Anthropic from "@anthropic/sdk";
+import {
+  GoogleGenerativeAI,
+  SchemaType,
+  type Content,
+  type FunctionDeclaration,
+  type FunctionResponsePart,
+  type Tool,
+} from "@google/generative-ai";
 import {
   Connection,
   Keypair,
@@ -17,40 +24,42 @@ dotenv.config();
 
 // ─── Config ───────────────────────────────────────────────────────────────
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN!;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY!;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY!;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash-lite";
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
 
 // ─── In-memory wallet store per user ──────────────────────────────────────
 const userWallets: Record<number, Keypair> = {};
-const userSessions: Record<number, Anthropic.MessageParam[]> = {};
+const userSessions: Record<number, Content[]> = {};
 const connection = new Connection(clusterApiUrl("devnet"), "confirmed");
 
 // ─── Wallet Tools ─────────────────────────────────────────────────────────
-const walletTools: Anthropic.Tool[] = [
+const walletToolDeclarations: FunctionDeclaration[] = [
   {
     name: "create_wallet",
     description: "Create a new Solana wallet for the user",
-    input_schema: { type: "object" as const, properties: {}, required: [] },
+    parameters: { type: SchemaType.OBJECT, properties: {}, required: [] },
   },
   {
     name: "get_balance",
     description: "Get the current SOL balance of the user's wallet",
-    input_schema: { type: "object" as const, properties: {}, required: [] },
+    parameters: { type: SchemaType.OBJECT, properties: {}, required: [] },
   },
   {
     name: "get_wallet_address",
     description: "Get the user's wallet public address",
-    input_schema: { type: "object" as const, properties: {}, required: [] },
+    parameters: { type: SchemaType.OBJECT, properties: {}, required: [] },
   },
   {
     name: "request_airdrop",
     description: "Request free SOL airdrop on devnet for testing",
-    input_schema: {
-      type: "object" as const,
+    parameters: {
+      type: SchemaType.OBJECT,
       properties: {
-        amount: { type: "number", description: "Amount of SOL to request (max 2)" },
+        amount: { type: SchemaType.NUMBER, description: "Amount of SOL to request (max 2)" },
       },
       required: [],
     },
@@ -58,16 +67,17 @@ const walletTools: Anthropic.Tool[] = [
   {
     name: "send_sol",
     description: "Send SOL to another wallet address",
-    input_schema: {
-      type: "object" as const,
+    parameters: {
+      type: SchemaType.OBJECT,
       properties: {
-        to_address: { type: "string", description: "Recipient Solana address" },
-        amount: { type: "number", description: "Amount of SOL to send" },
+        to_address: { type: SchemaType.STRING, description: "Recipient Solana address" },
+        amount: { type: SchemaType.NUMBER, description: "Amount of SOL to send" },
       },
       required: ["to_address", "amount"],
     },
   },
 ];
+const walletTools: Tool[] = [{ functionDeclarations: walletToolDeclarations }];
 
 // ─── Execute Tools ────────────────────────────────────────────────────────
 async function executeTool(
@@ -129,7 +139,7 @@ async function executeTool(
 async function runAgent(userId: number, userMessage: string): Promise<string> {
   if (!userSessions[userId]) userSessions[userId] = [];
 
-  userSessions[userId].push({ role: "user", content: userMessage });
+  userSessions[userId].push({ role: "user", parts: [{ text: userMessage }] });
 
   const systemPrompt = `You are an autonomous AI crypto wallet agent on Telegram. You help users manage their Solana wallets on devnet.
 You can create wallets, check balances, request airdrops, and send SOL.
@@ -140,40 +150,51 @@ ${userWallets[userId] ? `User's wallet: ${userWallets[userId].publicKey.toBase58
   let finalResponse = "";
 
   while (true) {
-    const response = await client.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1024,
-      system: systemPrompt,
+    const result = await model.generateContent({
+      contents: userSessions[userId],
+      systemInstruction: systemPrompt,
       tools: walletTools,
-      messages: userSessions[userId],
+      generationConfig: { maxOutputTokens: 1024 },
     });
+    const response = result.response;
+    const modelContent = response.candidates?.[0]?.content;
 
-    for (const block of response.content) {
-      if (block.type === "text") finalResponse = block.text;
-    }
-
-    if (response.stop_reason === "end_turn") {
-      userSessions[userId].push({ role: "assistant", content: response.content });
+    if (!modelContent?.parts?.length) {
+      if (!finalResponse) finalResponse = "I couldn't generate a response right now.";
       break;
     }
 
-    if (response.stop_reason === "tool_use") {
-      const toolResults: Anthropic.MessageParam = { role: "user", content: [] };
+    const textParts = modelContent.parts
+      .filter(
+        (part): part is { text: string } => "text" in part && typeof part.text === "string"
+      )
+      .map((part) => part.text.trim())
+      .filter(Boolean);
+    if (textParts.length > 0) finalResponse = textParts.join("\n");
 
-      for (const block of response.content) {
-        if (block.type === "tool_use") {
-          const result = await executeTool(block.name, block.input as Record<string, unknown>, userId);
-          (toolResults.content as Anthropic.ToolResultBlockParam[]).push({
-            type: "tool_result",
-            tool_use_id: block.id,
-            content: result,
-          });
-        }
-      }
+    userSessions[userId].push({ role: "model", parts: modelContent.parts });
 
-      userSessions[userId].push({ role: "assistant", content: response.content });
-      userSessions[userId].push(toolResults);
+    const functionCalls = response.functionCalls() ?? [];
+    if (functionCalls.length === 0) {
+      break;
     }
+
+    const functionResponses: FunctionResponsePart[] = [];
+    for (const call of functionCalls) {
+      const result = await executeTool(
+        call.name,
+        (call.args ?? {}) as Record<string, unknown>,
+        userId
+      );
+      functionResponses.push({
+        functionResponse: {
+          name: call.name,
+          response: { result },
+        },
+      });
+    }
+
+    userSessions[userId].push({ role: "user", parts: functionResponses });
   }
 
   return finalResponse;

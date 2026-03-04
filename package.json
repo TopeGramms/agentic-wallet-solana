@@ -10,19 +10,27 @@
     "dev": "ts-node-dev src/index.ts"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.95.4",
+    "@google/generative-ai": "^0.24.1",
     "@solana/spl-token": "^0.4.9",
-    "anthropic": "^0.36.3",
+    "@solana/web3.js": "^1.95.4",
+    "@types/node-telegram-bot-api": "^0.64.14",
+    "bs58": "^6.0.0",
     "dotenv": "^16.4.7",
-    "bs58": "^6.0.0"
+    "node-telegram-bot-api": "^0.67.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
-    "typescript": "^5.7.3",
     "ts-node": "^10.9.2",
-    "ts-node-dev": "^2.0.0"
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.7.3"
   },
-  "keywords": ["solana", "agentic-wallet", "ai-agent", "defi", "web3"],
+  "keywords": [
+    "solana",
+    "agentic-wallet",
+    "ai-agent",
+    "defi",
+    "web3"
+  ],
   "author": "",
   "license": "MIT"
 }
