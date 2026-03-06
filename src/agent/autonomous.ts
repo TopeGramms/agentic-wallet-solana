@@ -1,5 +1,5 @@
 import { Connection, Keypair, LAMPORTS_PER_SOL, clusterApiUrl } from "@solana/web3.js";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, type GenerativeModel } from "@google/generative-ai";
 import TelegramBot from "node-telegram-bot-api";
 import * as dotenv from "dotenv";
 
@@ -13,35 +13,74 @@ type Decision = {
   reasoning: string;
 };
 
+type RuntimeConfig = {
+  telegramToken: string;
+  telegramChatId: string;
+  geminiApiKey: string;
+  geminiModel: string;
+};
+
 // ----- Runtime Config -----
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const AIRDROP_SOL = 1;
-
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-  return value;
-}
+const MODEL_FALLBACKS = [
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-flash-lite-latest",
+  "gemini-flash-latest",
+];
 
 // ----- Environment -----
-const TELEGRAM_TOKEN = requireEnv("TELEGRAM_TOKEN");
-const TELEGRAM_CHAT_ID = requireEnv("TELEGRAM_CHAT_ID");
-const GEMINI_API_KEY = requireEnv("GEMINI_API_KEY");
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+function getEnv(...names: string[]): string | undefined {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value && value.trim()) return value.trim();
+  }
+  return undefined;
+}
 
-// ----- Service Clients -----
-const connection = new Connection(clusterApiUrl("devnet"), "confirmed");
-const wallet = Keypair.generate();
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
-const model = new GoogleGenerativeAI(GEMINI_API_KEY).getGenerativeModel({ model: GEMINI_MODEL });
-const actionHistory: string[] = [];
+function cleanChatId(chatId: string): string {
+  return chatId.replace(/^['"]|['"]$/g, "").trim();
+}
+
+function loadRuntimeConfig(): RuntimeConfig {
+  const telegramToken = getEnv("TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN");
+  const telegramChatIdRaw = getEnv("TELEGRAM_CHAT_ID");
+  const geminiApiKey = getEnv("GEMINI_API_KEY");
+  const geminiModel = getEnv("GEMINI_MODEL") || "gemini-2.5-flash-lite";
+
+  const missing: string[] = [];
+  if (!telegramToken) missing.push("TELEGRAM_TOKEN (or TELEGRAM_BOT_TOKEN)");
+  if (!telegramChatIdRaw) missing.push("TELEGRAM_CHAT_ID");
+  if (!geminiApiKey) missing.push("GEMINI_API_KEY");
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required environment variable(s): ${missing.join(", ")}.\n` +
+        "Set them in shell env or in a local .env file (never commit .env)."
+    );
+  }
+
+  const safeTelegramToken = telegramToken as string;
+  const safeTelegramChatIdRaw = telegramChatIdRaw as string;
+  const safeGeminiApiKey = geminiApiKey as string;
+
+  return {
+    telegramToken: safeTelegramToken,
+    telegramChatId: cleanChatId(safeTelegramChatIdRaw),
+    geminiApiKey: safeGeminiApiKey,
+    geminiModel,
+  };
+}
 
 // ----- Notifications -----
-async function notifyTelegram(message: string): Promise<void> {
+async function notifyTelegram(
+  bot: TelegramBot,
+  telegramChatId: string,
+  message: string
+): Promise<void> {
   try {
-    await bot.sendMessage(TELEGRAM_CHAT_ID, message);
+    await bot.sendMessage(telegramChatId, message);
   } catch (error) {
     const telegramDescription =
       (error as { response?: { body?: { description?: string } } }).response?.body
@@ -56,6 +95,37 @@ async function notifyTelegram(message: string): Promise<void> {
 
     console.error("Telegram notification failed:", telegramDescription);
   }
+}
+
+// ----- Gemini Model Resolver -----
+async function resolveModel(
+  geminiApiKey: string,
+  preferredModel: string
+): Promise<{ model: GenerativeModel; activeModelName: string }> {
+  const genAI = new GoogleGenerativeAI(geminiApiKey);
+  const candidates = Array.from(new Set([preferredModel, ...MODEL_FALLBACKS]));
+
+  for (const name of candidates) {
+    try {
+      const model = genAI.getGenerativeModel({ model: name });
+      await model.generateContent("Reply with exactly: OK");
+      return { model, activeModelName: name };
+    } catch (error) {
+      const msg = (error as Error).message || "";
+      const nonFatalModelError =
+        msg.includes("not found") ||
+        msg.includes("not supported") ||
+        msg.includes("quota") ||
+        msg.includes("429");
+      if (!nonFatalModelError) {
+        throw error;
+      }
+    }
+  }
+
+  throw new Error(
+    `Unable to initialize a working Gemini model. Tried: ${candidates.join(", ")}`
+  );
 }
 
 // ----- Decision Engine -----
@@ -94,10 +164,15 @@ function parseDecision(text: string): Decision {
   };
 }
 
-async function decideNextAction(balanceSol: number): Promise<Decision> {
+async function decideNextAction(
+  model: GenerativeModel,
+  walletAddress: string,
+  balanceSol: number,
+  actionHistory: string[]
+): Promise<Decision> {
   const prompt = [
     "You are an autonomous Solana Devnet wallet agent.",
-    `Wallet address: ${wallet.publicKey.toBase58()}`,
+    `Wallet address: ${walletAddress}`,
     `Current balance: ${balanceSol} SOL`,
     "Allowed actions: REQUEST_AIRDROP, HOLD, LOG_STATUS.",
     "Choose one action only.",
@@ -114,7 +189,12 @@ async function decideNextAction(balanceSol: number): Promise<Decision> {
 }
 
 // ----- Action Executor -----
-async function executeDecision(action: AgentAction, balanceSol: number): Promise<string> {
+async function executeDecision(
+  connection: Connection,
+  wallet: Keypair,
+  action: AgentAction,
+  balanceSol: number
+): Promise<string> {
   switch (action) {
     case "REQUEST_AIRDROP": {
       const signature = await connection.requestAirdrop(
@@ -139,13 +219,26 @@ function sleep(ms: number): Promise<void> {
 
 // ----- Main Autonomous Loop -----
 async function runAutonomousAgent(): Promise<void> {
+  const config = loadRuntimeConfig();
+  const connection = new Connection(clusterApiUrl("devnet"), "confirmed");
+  const wallet = Keypair.generate();
+  const bot = new TelegramBot(config.telegramToken, { polling: false });
+  const actionHistory: string[] = [];
+
+  const { model, activeModelName } = await resolveModel(
+    config.geminiApiKey,
+    config.geminiModel
+  );
+
   await notifyTelegram(
+    bot,
+    config.telegramChatId,
     [
       "Autonomous wallet agent started.",
       `Wallet: ${wallet.publicKey.toBase58()}`,
       "Network: Solana Devnet",
       `Check interval: ${CHECK_INTERVAL_MS / 60000} minutes`,
-      `Model: ${GEMINI_MODEL}`,
+      `Model: ${activeModelName}`,
     ].join("\n")
   );
 
@@ -156,8 +249,13 @@ async function runAutonomousAgent(): Promise<void> {
 
       const lamports = await connection.getBalance(wallet.publicKey, "confirmed");
       const balanceSol = lamports / LAMPORTS_PER_SOL;
-      const decision = await decideNextAction(balanceSol);
-      const result = await executeDecision(decision.action, balanceSol);
+      const decision = await decideNextAction(
+        model,
+        wallet.publicKey.toBase58(),
+        balanceSol,
+        actionHistory
+      );
+      const result = await executeDecision(connection, wallet, decision.action, balanceSol);
 
       const updatedLamports = await connection.getBalance(wallet.publicKey, "confirmed");
       const updatedBalanceSol = updatedLamports / LAMPORTS_PER_SOL;
@@ -167,6 +265,8 @@ async function runAutonomousAgent(): Promise<void> {
       if (actionHistory.length > 25) actionHistory.shift();
 
       await notifyTelegram(
+        bot,
+        config.telegramChatId,
         [
           `Cycle #${cycle}`,
           `Decision: ${decision.action}`,
@@ -176,7 +276,11 @@ async function runAutonomousAgent(): Promise<void> {
         ].join("\n")
       );
     } catch (error) {
-      await notifyTelegram(`Agent error: ${(error as Error).message}`);
+      await notifyTelegram(
+        bot,
+        config.telegramChatId,
+        `Agent error: ${(error as Error).message}`
+      );
     }
 
     await sleep(CHECK_INTERVAL_MS);
@@ -184,9 +288,7 @@ async function runAutonomousAgent(): Promise<void> {
 }
 
 // ----- Entrypoint -----
-runAutonomousAgent().catch(async (error) => {
-  const message = `Fatal autonomous agent error: ${(error as Error).message}`;
-  console.error(message);
-  await notifyTelegram(message);
+runAutonomousAgent().catch((error) => {
+  console.error(`Fatal autonomous agent error: ${(error as Error).message}`);
   process.exit(1);
 });
