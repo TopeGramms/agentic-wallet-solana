@@ -1,31 +1,32 @@
-import Anthropic from "@anthropic/sdk";
+import {
+  GoogleGenerativeAI,
+  SchemaType,
+  type Content,
+  type FunctionDeclaration,
+  type FunctionResponsePart,
+  type Tool,
+} from "@google/generative-ai";
 import { AgenticWallet } from "../wallet/AgenticWallet";
 
-const client = new Anthropic();
-
-// ─── Tool definitions for the AI agent ────────────────────────────────────
-const walletTools: Anthropic.Tool[] = [
+// ----- Tool Definitions -----
+const walletToolDeclarations: FunctionDeclaration[] = [
   {
     name: "get_balance",
     description: "Get the current SOL balance of the wallet",
-    input_schema: {
-      type: "object" as const,
-      properties: {},
-      required: [],
-    },
+    parameters: { type: SchemaType.OBJECT, properties: {}, required: [] },
   },
   {
     name: "send_sol",
     description: "Send SOL to another wallet address",
-    input_schema: {
-      type: "object" as const,
+    parameters: {
+      type: SchemaType.OBJECT,
       properties: {
         to_address: {
-          type: "string",
+          type: SchemaType.STRING,
           description: "The recipient's Solana wallet address",
         },
         amount: {
-          type: "number",
+          type: SchemaType.NUMBER,
           description: "Amount of SOL to send",
         },
       },
@@ -35,11 +36,11 @@ const walletTools: Anthropic.Tool[] = [
   {
     name: "request_airdrop",
     description: "Request a SOL airdrop on devnet for testing",
-    input_schema: {
-      type: "object" as const,
+    parameters: {
+      type: SchemaType.OBJECT,
       properties: {
         amount: {
-          type: "number",
+          type: SchemaType.NUMBER,
           description: "Amount of SOL to request (max 2 SOL on devnet)",
         },
       },
@@ -49,20 +50,16 @@ const walletTools: Anthropic.Tool[] = [
   {
     name: "get_wallet_info",
     description: "Get full wallet information including public key and balance",
-    input_schema: {
-      type: "object" as const,
-      properties: {},
-      required: [],
-    },
+    parameters: { type: SchemaType.OBJECT, properties: {}, required: [] },
   },
   {
     name: "get_spl_token_balance",
     description: "Get the balance of a specific SPL token",
-    input_schema: {
-      type: "object" as const,
+    parameters: {
+      type: SchemaType.OBJECT,
       properties: {
         mint_address: {
-          type: "string",
+          type: SchemaType.STRING,
           description: "The mint address of the SPL token",
         },
       },
@@ -72,19 +69,19 @@ const walletTools: Anthropic.Tool[] = [
   {
     name: "send_spl_token",
     description: "Send SPL tokens to another wallet address",
-    input_schema: {
-      type: "object" as const,
+    parameters: {
+      type: SchemaType.OBJECT,
       properties: {
         mint_address: {
-          type: "string",
+          type: SchemaType.STRING,
           description: "The mint address of the SPL token",
         },
         to_address: {
-          type: "string",
+          type: SchemaType.STRING,
           description: "The recipient's Solana wallet address",
         },
         amount: {
-          type: "number",
+          type: SchemaType.NUMBER,
           description: "Amount of tokens to send",
         },
       },
@@ -93,7 +90,9 @@ const walletTools: Anthropic.Tool[] = [
   },
 ];
 
-// ─── Execute wallet tools ──────────────────────────────────────────────────
+const walletTools: Tool[] = [{ functionDeclarations: walletToolDeclarations }];
+
+// ----- Wallet Tool Executor -----
 async function executeTool(
   toolName: string,
   toolInput: Record<string, unknown>,
@@ -143,19 +142,24 @@ async function executeTool(
   }
 }
 
-// ─── Main AI Agent loop ────────────────────────────────────────────────────
+// ----- Gemini Wallet Agent Loop -----
 export async function runWalletAgent(
   userInstruction: string,
   wallet: AgenticWallet
 ): Promise<string> {
-  console.log(`\n🤖 Agent received instruction: "${userInstruction}"\n`);
+  console.log(`\nAgent received instruction: "${userInstruction}"\n`);
 
-  const messages: Anthropic.MessageParam[] = [
-    {
-      role: "user",
-      content: userInstruction,
-    },
-  ];
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  if (!geminiApiKey) {
+    throw new Error("Missing GEMINI_API_KEY");
+  }
+
+  const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+  const model = new GoogleGenerativeAI(geminiApiKey).getGenerativeModel({
+    model: geminiModel,
+  });
+
+  const messages: Content[] = [{ role: "user", parts: [{ text: userInstruction }] }];
 
   const systemPrompt = `You are an autonomous AI agent that controls a Solana wallet on devnet.
 You can perform wallet operations like checking balances, sending SOL, requesting airdrops, and managing SPL tokens.
@@ -165,60 +169,60 @@ Wallet public key: ${wallet.publicKey}`;
 
   let finalResponse = "";
 
-  // Agentic loop
   while (true) {
-    const response = await client.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1024,
-      system: systemPrompt,
+    const result = await model.generateContent({
+      contents: messages,
+      systemInstruction: systemPrompt,
       tools: walletTools,
-      messages,
+      generationConfig: { maxOutputTokens: 1024 },
     });
 
-    console.log(`🔄 Agent thinking... (stop_reason: ${response.stop_reason})`);
+    const response = result.response;
+    const modelContent = response.candidates?.[0]?.content;
 
-    // Collect text from response
-    for (const block of response.content) {
-      if (block.type === "text") {
-        finalResponse = block.text;
-        console.log(`💬 Agent: ${block.text}`);
-      }
-    }
-
-    // If done, break
-    if (response.stop_reason === "end_turn") {
+    if (!modelContent?.parts?.length) {
+      if (!finalResponse) finalResponse = "No response generated.";
       break;
     }
 
-    // Handle tool use
-    if (response.stop_reason === "tool_use") {
-      const toolResults: Anthropic.MessageParam = {
-        role: "user",
-        content: [],
-      };
+    const textParts = modelContent.parts
+      .filter(
+        (part): part is { text: string } => "text" in part && typeof part.text === "string"
+      )
+      .map((part) => part.text.trim())
+      .filter(Boolean);
 
-      for (const block of response.content) {
-        if (block.type === "tool_use") {
-          console.log(`🔧 Using tool: ${block.name} with input:`, block.input);
-          const result = await executeTool(
-            block.name,
-            block.input as Record<string, unknown>,
-            wallet
-          );
-          console.log(`✅ Tool result: ${result}`);
-
-          (toolResults.content as Anthropic.ToolResultBlockParam[]).push({
-            type: "tool_result",
-            tool_use_id: block.id,
-            content: result,
-          });
-        }
-      }
-
-      // Add assistant response and tool results to message history
-      messages.push({ role: "assistant", content: response.content });
-      messages.push(toolResults);
+    if (textParts.length > 0) {
+      finalResponse = textParts.join("\n");
+      console.log(`Agent: ${finalResponse}`);
     }
+
+    messages.push({ role: "model", parts: modelContent.parts });
+
+    const functionCalls = response.functionCalls() ?? [];
+    if (functionCalls.length === 0) {
+      break;
+    }
+
+    const functionResponses: FunctionResponsePart[] = [];
+    for (const call of functionCalls) {
+      console.log(`Using tool: ${call.name} with input:`, call.args);
+      const toolResult = await executeTool(
+        call.name,
+        (call.args ?? {}) as Record<string, unknown>,
+        wallet
+      );
+      console.log(`Tool result: ${toolResult}`);
+
+      functionResponses.push({
+        functionResponse: {
+          name: call.name,
+          response: { result: toolResult },
+        },
+      });
+    }
+
+    messages.push({ role: "user", parts: functionResponses });
   }
 
   return finalResponse;

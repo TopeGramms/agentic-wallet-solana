@@ -1,58 +1,75 @@
-import { SolanaAgentKit, KeypairWallet } from "solana-agent-kit";
-import TokenPlugin from "@solana-agent-kit/plugin-token";
-import MiscPlugin from "@solana-agent-kit/plugin-misc";
-import { Keypair, Connection, clusterApiUrl, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { Connection, Keypair, LAMPORTS_PER_SOL, clusterApiUrl } from "@solana/web3.js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import TelegramBot from "node-telegram-bot-api";
-import bs58 from "bs58";
 import * as dotenv from "dotenv";
 
 dotenv.config();
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY!;
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN!;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
-const CHECK_INTERVAL_MS = 3 * 60 * 1000; // 3 minutes
+// ----- Types -----
+type AgentAction = "REQUEST_AIRDROP" | "HOLD" | "LOG_STATUS";
 
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-lite" });
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return value;
+}
 
-// ─── Agent personalities / goals ──────────────────────────────────────────
+// ----- Environment -----
+const TELEGRAM_TOKEN = requireEnv("TELEGRAM_TOKEN");
+const TELEGRAM_CHAT_ID = requireEnv("TELEGRAM_CHAT_ID");
+const GEMINI_API_KEY = requireEnv("GEMINI_API_KEY");
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+const CHECK_INTERVAL_MS = 3 * 60 * 1000;
+
+// ----- Agent Definitions -----
 const AGENTS = [
   {
     id: "Agent-Alpha",
     goal: "Maintain a healthy SOL balance above 0.5 SOL at all times",
-    emoji: "🔵",
+    emoji: "ALPHA",
   },
   {
     id: "Agent-Beta",
     goal: "Monitor wallet and log status every cycle without taking risky actions",
-    emoji: "🟢",
+    emoji: "BETA",
   },
   {
     id: "Agent-Gamma",
     goal: "Be conservative - only act when balance drops below 0.2 SOL",
-    emoji: "🟡",
+    emoji: "GAMMA",
   },
 ];
 
+// ----- Service Clients -----
+const model = new GoogleGenerativeAI(GEMINI_API_KEY).getGenerativeModel({ model: GEMINI_MODEL });
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
+
+// ----- Notifications -----
 async function notifyTelegram(message: string): Promise<void> {
   try {
-    await bot.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: "Markdown" });
-  } catch (e) {
-    console.error("Telegram error:", e);
+    await bot.sendMessage(TELEGRAM_CHAT_ID, message);
+  } catch (error) {
+    console.error("Telegram error:", (error as Error).message);
   }
 }
 
-// ─── Single agent tick ────────────────────────────────────────────────────
+// ----- Decision Utilities -----
+function parseAction(raw: string | undefined): AgentAction {
+  const value = (raw || "").toUpperCase();
+  if (value === "REQUEST_AIRDROP" || value === "LOG_STATUS") return value;
+  return "HOLD";
+}
+
+// ----- Per-Agent Cycle -----
 async function agentTick(
-  agentConfig: typeof AGENTS[0],
+  agentConfig: (typeof AGENTS)[number],
   keypair: Keypair,
   connection: Connection,
   cycleCount: number
 ): Promise<void> {
-  const balance = (await connection.getBalance(keypair.publicKey)) / LAMPORTS_PER_SOL;
+  const balance = (await connection.getBalance(keypair.publicKey, "confirmed")) / LAMPORTS_PER_SOL;
 
   const prompt = `You are ${agentConfig.id}, an autonomous Solana wallet agent.
 Your goal: ${agentConfig.goal}
@@ -69,80 +86,69 @@ Respond ONLY with JSON:
   const text = result.response.text().trim();
   const jsonMatch = text.match(/\{[\s\S]*\}/);
 
-  let action = "HOLD";
+  let action: AgentAction = "HOLD";
   let reasoning = "Default hold";
 
   if (jsonMatch) {
-    const parsed = JSON.parse(jsonMatch[0]);
-    action = parsed.action;
-    reasoning = parsed.reasoning;
+    try {
+      const parsed = JSON.parse(jsonMatch[0]) as { action?: string; reasoning?: string };
+      action = parseAction(parsed.action);
+      reasoning = parsed.reasoning || reasoning;
+    } catch {
+      action = "HOLD";
+    }
   }
 
-  // Execute
   let actionResult = "";
   if (action === "REQUEST_AIRDROP") {
     try {
       const sig = await connection.requestAirdrop(keypair.publicKey, 1 * LAMPORTS_PER_SOL);
-      await connection.confirmTransaction(sig);
-      actionResult = `Airdrop successful!`;
-    } catch (e) {
-      actionResult = `Airdrop failed: ${(e as Error).message}`;
+      await connection.confirmTransaction(sig, "confirmed");
+      actionResult = "Airdrop successful";
+    } catch (error) {
+      actionResult = `Airdrop failed: ${(error as Error).message}`;
     }
   } else {
     actionResult = action === "LOG_STATUS" ? `Balance logged: ${balance} SOL` : "Holding position";
   }
 
-  // Report to Telegram
   await notifyTelegram(
-    `${agentConfig.emoji} *${agentConfig.id}* — Cycle #${cycleCount}\n` +
-    `🎯 Goal: ${agentConfig.goal}\n` +
-    `💰 Balance: ${balance} SOL\n` +
-    `🧠 Decision: ${action}\n` +
-    `💭 Reason: ${reasoning}\n` +
-    `📋 Result: ${actionResult}`
+    `${agentConfig.emoji} ${agentConfig.id} - Cycle #${cycleCount}\n` +
+      `Goal: ${agentConfig.goal}\n` +
+      `Balance: ${balance} SOL\n` +
+      `Decision: ${action}\n` +
+      `Reason: ${reasoning}\n` +
+      `Result: ${actionResult}`
   );
-
-  console.log(`${agentConfig.emoji} ${agentConfig.id}: ${action} — ${reasoning}`);
 }
 
-// ─── Run all agents ────────────────────────────────────────────────────────
+// ----- Main Multi-Agent Loop -----
 async function runMultiAgent(): Promise<void> {
-  console.log("🤖 Starting Multi-Agent System...");
-
   const connection = new Connection(clusterApiUrl("devnet"), "confirmed");
-
-  // Create a wallet for each agent
   const agentWallets = AGENTS.map(() => Keypair.generate());
 
   await notifyTelegram(
-    `🚀 *Multi-Agent System Started!*\n\n` +
-    AGENTS.map((a, i) =>
-      `${a.emoji} *${a.id}*\n` +
-      `📍 \`${agentWallets[i].publicKey.toBase58()}\`\n` +
-      `🎯 ${a.goal}`
-    ).join("\n\n") +
-    `\n\n_3 agents running independently on Solana Devnet!_`
+    "Multi-agent system started.\n\n" +
+      AGENTS.map(
+        (agent, i) =>
+          `${agent.emoji} ${agent.id}\nWallet: ${agentWallets[i].publicKey.toBase58()}\nGoal: ${agent.goal}`
+      ).join("\n\n")
   );
 
-  let cycleCount = 0;
-
-  while (cycleCount < 20) {
-    cycleCount++;
-    console.log(`\n🔄 === Cycle ${cycleCount} ===`);
-
-    // Run all agents in parallel
+  for (let cycleCount = 1; cycleCount <= 20; cycleCount += 1) {
     await Promise.all(
       AGENTS.map((agentConfig, i) =>
-        agentTick(agentConfig, agentWallets[i], connection, cycleCount)
-          .catch(e => console.error(`${agentConfig.id} error:`, e))
+        agentTick(agentConfig, agentWallets[i], connection, cycleCount).catch((error) =>
+          console.error(`${agentConfig.id} error:`, (error as Error).message)
+        )
       )
     );
 
-    console.log(`⏳ Waiting ${CHECK_INTERVAL_MS / 1000}s...`);
-    await new Promise(resolve => setTimeout(resolve, CHECK_INTERVAL_MS));
+    await new Promise((resolve) => setTimeout(resolve, CHECK_INTERVAL_MS));
   }
 
-  await notifyTelegram("🏁 *Multi-agent session complete!* All agents finished their cycles.");
+  await notifyTelegram("Multi-agent session complete.");
 }
 
-runMultiAgent().catch(console.error);
+// ----- Entrypoint -----
+runMultiAgent().catch((error) => console.error("Fatal multi-agent error:", (error as Error).message));
