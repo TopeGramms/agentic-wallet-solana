@@ -3,6 +3,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
 import { Mistral } from "@mistralai/mistralai";
 import TelegramBot from "node-telegram-bot-api";
+import { createServer } from "http";
 import * as dotenv from "dotenv";
 
 dotenv.config();
@@ -46,6 +47,10 @@ type AgentState = {
 type RuntimeConfig = {
   telegramToken: string;
   telegramChatId: string;
+  useWebhook: boolean;
+  webhookUrl: string | null;
+  webhookPath: string;
+  port: number;
   rpcEndpoints: string[];
   runReportOnStart: boolean;
   airdropEnabled: boolean;
@@ -182,9 +187,23 @@ function loadRuntimeConfig(): RuntimeConfig {
     );
   }
 
+  const useWebhook = parseEnvBoolean("TELEGRAM_USE_WEBHOOK", false);
+  const webhookUrl = getEnv("TELEGRAM_WEBHOOK_URL") || null;
+  if (useWebhook && !webhookUrl) {
+    throw new Error(
+      "TELEGRAM_USE_WEBHOOK is true but TELEGRAM_WEBHOOK_URL is missing."
+    );
+  }
+  const webhookPath = getEnv("TELEGRAM_WEBHOOK_PATH") || "/telegram/webhook";
+  const port = parseEnvInteger("PORT", 3000);
+
   return {
     telegramToken: telegramToken as string,
     telegramChatId: cleanChatId(telegramChatIdRaw as string),
+    useWebhook,
+    webhookUrl,
+    webhookPath,
+    port,
     rpcEndpoints: parseRpcEndpoints(),
     runReportOnStart: parseEnvBoolean("MULTI_AGENT_REPORT_ON_START", true),
     airdropEnabled: parseEnvBoolean("MULTI_AGENT_AIRDROP_ENABLED", true),
@@ -196,6 +215,54 @@ function loadRuntimeConfig(): RuntimeConfig {
     airdropCooldownMs: parseEnvNumber("MULTI_AGENT_AIRDROP_COOLDOWN_MINUTES", 90) * 60 * 1000,
     faucetBackoffMs: parseEnvNumber("MULTI_AGENT_FAUCET_BACKOFF_MINUTES", 720) * 60 * 1000,
   };
+}
+
+// ----- Telegram Transport -----
+async function startTelegramTransport(
+  bot: TelegramBot,
+  config: RuntimeConfig
+): Promise<void> {
+  if (!config.useWebhook) {
+    await bot.deleteWebHook();
+    await bot.startPolling();
+    console.log("Telegram transport: polling mode");
+    return;
+  }
+
+  const webhookPath = config.webhookPath.startsWith("/")
+    ? config.webhookPath
+    : `/${config.webhookPath}`;
+  const webhookUrl = `${config.webhookUrl}${webhookPath}`;
+  await bot.setWebHook(webhookUrl);
+
+  const server = createServer((req, res) => {
+    if (req.method !== "POST" || !req.url || req.url !== webhookPath) {
+      res.statusCode = 404;
+      res.end("Not found");
+      return;
+    }
+
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk.toString("utf8");
+    });
+    req.on("end", async () => {
+      try {
+        const update = JSON.parse(body);
+        await bot.processUpdate(update);
+        res.statusCode = 200;
+        res.end("OK");
+      } catch {
+        res.statusCode = 400;
+        res.end("Invalid update");
+      }
+    });
+  });
+
+  server.listen(config.port, () => {
+    console.log(`Telegram transport: webhook mode on port ${config.port}`);
+    console.log(`Telegram webhook path: ${webhookPath}`);
+  });
 }
 
 // ----- Notifications -----
@@ -774,9 +841,9 @@ async function runMultiAgent(): Promise<void> {
     (endpoint) => new Connection(endpoint, { commitment: "confirmed", disableRetryOnRateLimit: true })
   );
 
-  // polling: true so the bot can receive messages from Gramms
-  const bot = new TelegramBot(config.telegramToken, { polling: true });
-  console.log("Multi-agent bot started in polling mode.");
+  const bot = new TelegramBot(config.telegramToken, { polling: false });
+  await startTelegramTransport(bot, config);
+  console.log("Multi-agent bot process started.");
   console.log(`Primary RPC endpoint: ${connections[0].rpcEndpoint}`);
 
   const states: AgentState[] = AGENTS.map(() => ({

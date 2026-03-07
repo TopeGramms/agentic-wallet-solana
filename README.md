@@ -64,6 +64,28 @@ Multi-agent simulation:
 npx ts-node src/agent/multiAgent.ts
 ```
 
+## Render Web Service (Webhook Mode)
+For low-cost hosting, run the multi-agent bot in webhook mode.
+
+Set these env vars on Render:
+```env
+TELEGRAM_USE_WEBHOOK=true
+TELEGRAM_WEBHOOK_URL=https://<your-service>.onrender.com
+TELEGRAM_WEBHOOK_PATH=/telegram/webhook
+PORT=10000
+```
+
+Render service settings:
+```text
+Type: Web Service
+Build Command: npm install && npm run build
+Start Command: node dist/agent/multiAgent.js
+```
+
+Notes:
+- Keep `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, and AI keys in Render env only.
+- If you run locally, set `TELEGRAM_USE_WEBHOOK=false` to use polling.
+
 ## Build and Test
 ```bash
 npm run build
