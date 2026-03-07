@@ -1,6 +1,7 @@
 import { Connection, Keypair, LAMPORTS_PER_SOL, clusterApiUrl } from "@solana/web3.js";
 import { GoogleGenerativeAI, type GenerativeModel } from "@google/generative-ai";
 import TelegramBot from "node-telegram-bot-api";
+import bs58 from "bs58";
 import * as dotenv from "dotenv";
 
 dotenv.config();
@@ -17,6 +18,7 @@ type Decision = {
 type RuntimeConfig = {
   telegramToken: string;
   telegramChatId: string;
+  walletPrivateKey: string;
   geminiApiKey: string;
   geminiModel: string;
   checkIntervalMs: number;
@@ -73,9 +75,30 @@ function parseEnvBoolean(name: string, fallback: boolean): boolean {
   return fallback;
 }
 
+function decodeSecretKey(input: string): Uint8Array {
+  const value = input.trim();
+
+  if (value.startsWith("[") && value.endsWith("]")) {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) throw new Error("Secret key JSON must be an array.");
+    return Uint8Array.from(parsed.map((n) => Number(n)));
+  }
+
+  if (value.includes(",")) {
+    const parts = value.split(",").map((part) => Number(part.trim()));
+    if (parts.some((n) => !Number.isFinite(n))) {
+      throw new Error("Secret key CSV contains non-numeric values.");
+    }
+    return Uint8Array.from(parts);
+  }
+
+  return bs58.decode(value);
+}
+
 function loadRuntimeConfig(): RuntimeConfig {
   const telegramToken = getEnv("TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN");
   const telegramChatIdRaw = getEnv("TELEGRAM_CHAT_ID");
+  const walletPrivateKey = getEnv("AUTONOMOUS_WALLET_PRIVATE_KEY", "WALLET_PRIVATE_KEY") || "";
   const geminiApiKey = getEnv("GEMINI_API_KEY");
   const geminiModel = getEnv("GEMINI_MODEL") || "gemini-2.5-flash-lite";
   const aiEnabled = parseEnvBoolean("AUTONOMOUS_AI_ENABLED", true);
@@ -96,6 +119,7 @@ function loadRuntimeConfig(): RuntimeConfig {
   return {
     telegramToken: telegramToken as string,
     telegramChatId: cleanChatId(telegramChatIdRaw as string),
+    walletPrivateKey,
     geminiApiKey: geminiApiKey || "",
     geminiModel,
     checkIntervalMs: parseEnvNumber("AUTONOMOUS_CHECK_INTERVAL_MINUTES", 15) * 60 * 1000,
@@ -109,6 +133,24 @@ function loadRuntimeConfig(): RuntimeConfig {
     aiEnabled,
     aiMaxCallsPerRun,
   };
+}
+
+function loadOrCreateAutonomousWallet(config: RuntimeConfig): Keypair {
+  if (!config.walletPrivateKey) {
+    const generated = Keypair.generate();
+    console.warn(
+      `AUTONOMOUS_WALLET_PRIVATE_KEY not set. Generated ephemeral wallet ${generated.publicKey.toBase58()}`
+    );
+    return generated;
+  }
+
+  const decoded = decodeSecretKey(config.walletPrivateKey);
+  if (decoded.length !== 64) {
+    throw new Error(
+      `AUTONOMOUS_WALLET_PRIVATE_KEY must decode to 64 bytes. Received ${decoded.length}.`
+    );
+  }
+  return Keypair.fromSecretKey(decoded);
 }
 
 // ----- Notifications -----
@@ -317,7 +359,7 @@ function sleep(ms: number): Promise<void> {
 async function runAutonomousAgent(): Promise<void> {
   const config = loadRuntimeConfig();
   const connection = new Connection(clusterApiUrl("devnet"), "confirmed");
-  const wallet = Keypair.generate();
+  const wallet = loadOrCreateAutonomousWallet(config);
   const bot = new TelegramBot(config.telegramToken, { polling: false });
   const actionHistory: string[] = [];
 

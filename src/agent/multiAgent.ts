@@ -4,6 +4,7 @@ import Groq from "groq-sdk";
 import { Mistral } from "@mistralai/mistralai";
 import TelegramBot from "node-telegram-bot-api";
 import { createServer } from "http";
+import bs58 from "bs58";
 import * as dotenv from "dotenv";
 
 dotenv.config();
@@ -25,6 +26,7 @@ type AgentConfig = {
   provider: ProviderName;
   model: string;
   apiKeyEnv: "GEMINI_API_KEY" | "GROQ_API_KEY" | "MISTRAL_API_KEY";
+  walletKeyEnv: "AGENT_ALPHA_PRIVATE_KEY" | "AGENT_BETA_PRIVATE_KEY" | "AGENT_GAMMA_PRIVATE_KEY";
   lowBalanceSol: number;
   healthyBalanceSol: number;
   logStatusEveryCycles: number;
@@ -87,6 +89,7 @@ const AGENTS: AgentConfig[] = [
     provider: "GEMINI",
     model: "gemini-2.0-flash-lite",
     apiKeyEnv: "GEMINI_API_KEY",
+    walletKeyEnv: "AGENT_ALPHA_PRIVATE_KEY",
     lowBalanceSol: 0.5,
     healthyBalanceSol: 1.1,
     logStatusEveryCycles: 4,
@@ -99,6 +102,7 @@ const AGENTS: AgentConfig[] = [
     provider: "GROQ",
     model: "llama-3.1-8b-instant",
     apiKeyEnv: "GROQ_API_KEY",
+    walletKeyEnv: "AGENT_BETA_PRIVATE_KEY",
     lowBalanceSol: 0.4,
     healthyBalanceSol: 0.9,
     logStatusEveryCycles: 1,
@@ -111,6 +115,7 @@ const AGENTS: AgentConfig[] = [
     provider: "MISTRAL",
     model: "mistral-small-latest",
     apiKeyEnv: "MISTRAL_API_KEY",
+    walletKeyEnv: "AGENT_GAMMA_PRIVATE_KEY",
     lowBalanceSol: 0.2,
     healthyBalanceSol: 0.7,
     logStatusEveryCycles: 6,
@@ -162,6 +167,46 @@ function parseRpcEndpoints(): string[] {
     ...fallbackEndpoints,
     ...DEFAULT_RPC_ENDPOINTS,
   ]));
+}
+
+function decodeSecretKey(input: string): Uint8Array {
+  const value = input.trim();
+
+  if (value.startsWith("[") && value.endsWith("]")) {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) throw new Error("Secret key JSON must be an array.");
+    return Uint8Array.from(parsed.map((n) => Number(n)));
+  }
+
+  if (value.includes(",")) {
+    const parts = value.split(",").map((part) => Number(part.trim()));
+    if (parts.some((n) => !Number.isFinite(n))) {
+      throw new Error("Secret key CSV contains non-numeric values.");
+    }
+    return Uint8Array.from(parts);
+  }
+
+  return bs58.decode(value);
+}
+
+function loadOrCreateAgentWallet(agent: AgentConfig): Keypair {
+  const raw = getEnv(agent.walletKeyEnv);
+  if (!raw) {
+    const generated = Keypair.generate();
+    console.warn(
+      `${agent.id}: ${agent.walletKeyEnv} not set. Generated ephemeral wallet ${generated.publicKey.toBase58()}`
+    );
+    return generated;
+  }
+
+  const decoded = decodeSecretKey(raw);
+  if (decoded.length !== 64) {
+    throw new Error(
+      `${agent.id}: ${agent.walletKeyEnv} must decode to 64 bytes. Received ${decoded.length}.`
+    );
+  }
+
+  return Keypair.fromSecretKey(decoded);
 }
 
 function loadRuntimeConfig(): RuntimeConfig {
@@ -846,8 +891,8 @@ async function runMultiAgent(): Promise<void> {
   console.log("Multi-agent bot process started.");
   console.log(`Primary RPC endpoint: ${connections[0].rpcEndpoint}`);
 
-  const states: AgentState[] = AGENTS.map(() => ({
-    wallet: Keypair.generate(),
+  const states: AgentState[] = AGENTS.map((agent) => ({
+    wallet: loadOrCreateAgentWallet(agent),
     actionHistory: [],
     aiCallCount: 0,
     aiBudgetRemaining: config.aiEnabled ? config.aiMaxCallsPerAgent : 0,
