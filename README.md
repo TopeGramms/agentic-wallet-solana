@@ -1,73 +1,144 @@
-# Agentic Wallet Solana (Gemini + Telegram)
+# Agentic Wallet Solana (Superteam Nigeria Bounty)
 
-AI wallet agents on Solana Devnet using:
-- `@google/generative-ai`
-- `@solana/web3.js`
-- `node-telegram-bot-api`
+TypeScript-based agentic wallet system on **Solana Devnet** with autonomous AI agents and Telegram control.
 
-This repo includes:
-- A Telegram wallet bot (`src/telegram/bot.ts`)
-- A single autonomous agent (`src/agent/autonomous.ts`)
-- A multi-agent simulation (`src/agent/multiAgent.ts`)
+Repository: `https://github.com/TopeGramms/agentic-wallet-solana`
 
-## Requirements
+## What Was Built
+- 3 autonomous wallet agents:
+  - `Agent-Alpha` (Gemini)
+  - `Agent-Beta` (Groq)
+  - `Agent-Gamma` (Mistral)
+- Each agent manages its **own wallet state** and decision lifecycle.
+- Decision model: **rules-first, AI fallback**.
+- Telegram command interface:
+  - `/alpha`, `/beta`, `/gamma`, `/status`, `/report`
+- Scheduled autonomous reporting at **8am and 8pm** (with startup reporting support).
+- Live deployment on Render.
+
+## Bounty Requirement Coverage
+### 1) Agentic wallet capabilities
+This implementation demonstrates that the wallet system can:
+- Create wallets programmatically via Solana `Keypair.generate()`.
+- Sign transactions automatically without manual signature prompts.
+- Hold SOL on Solana Devnet and query balances.
+- Interact with a dApp simulation (`src/dapp/TestDApp.ts`).
+
+### 2) Deep dive: wallet architecture and agent interaction
+#### Wallet design
+- `src/wallet/AgenticWallet.ts` is the wallet abstraction layer.
+- It wraps keypair creation/import, RPC connection, balance retrieval, transfers, and airdrops.
+- `src/agent/WalletAgent.ts` consumes wallet capabilities for LLM-driven tasks.
+
+#### Agent architecture
+- `src/agent/multiAgent.ts`
+  - Multi-agent runtime with isolated in-memory state per agent.
+  - Separate AI provider per agent.
+  - Rule engine drives decisions first; model calls are fallback.
+  - Telegram command handlers + scheduled reports.
+- `src/agent/autonomous.ts`
+  - Single autonomous agent loop with conservative controls.
+
+#### Clear separation of concerns
+- Wallet operations: `src/wallet/AgenticWallet.ts`
+- Agent orchestration/decision logic: `src/agent/*.ts`
+- Telegram interaction layer: `src/telegram/bot.ts` and bot logic inside `src/agent/multiAgent.ts`
+- dApp simulation: `src/dapp/TestDApp.ts`
+
+#### Security and key management
+- Secrets are loaded from environment variables only.
+- `.env` is gitignored; `.env.example` is the template.
+- Private keys are never intended to be hardcoded in source.
+- Devnet-only operations reduce real-funds risk during prototype stage.
+- Airdrop controls, cooldowns, and backoff logic are included to avoid faucet abuse.
+
+### 3) Setup and run instructions
+See sections below for local setup and Render deployment.
+
+### 4) Scalability
+- Supports multiple independent agents simultaneously.
+- Each agent maintains isolated wallet/action state.
+- Architecture is compatible with adding more agents/providers by extending agent config.
+
+## Functional Demonstration
+Typical flow:
+1. Start service.
+2. Telegram `/start` initializes interaction.
+3. `/report` triggers full autonomous run for all agents.
+4. `/alpha`, `/beta`, `/gamma` provides agent-specific responses and status.
+5. Scheduled autonomous updates run at 8am and 8pm.
+
+For judging/demo, this gives:
+- autonomous wallet behavior,
+- independent multi-agent state,
+- and real-time Telegram observability.
+
+## Core Files
+- `src/wallet/AgenticWallet.ts` (`agenticWallet.ts` in bounty wording)
+- `src/agent/WalletAgent.ts` (`walletAgent.ts`)
+- `src/dapp/TestDApp.ts` (`testDApp.ts`)
+- `src/agent/multiAgent.ts`
+- `src/agent/autonomous.ts`
+
+## Prerequisites
 - Node.js 18+
 - npm
-- Gemini API key
 - Telegram bot token
+- Solana devnet connectivity
+- API keys for providers you enable:
+  - Gemini
+  - Groq
+  - Mistral
 
-## Install
+## Local Setup
+1. Install dependencies:
 ```bash
 npm install
 ```
 
-## Environment
-Copy and fill env values:
+2. Create env file:
 ```bash
 cp .env.example .env
 ```
 
-Required variables:
-```env
-TELEGRAM_TOKEN=your_telegram_bot_token_here
-TELEGRAM_CHAT_ID=your_numeric_chat_id_here
-GEMINI_API_KEY=your_gemini_api_key_here
-GEMINI_MODEL=gemini-2.5-flash-lite
-WALLET_PRIVATE_KEY=your_base58_private_key_here_or_leave_blank_to_generate
-```
+3. Fill required variables in `.env`.
 
-Notes:
-- `TELEGRAM_CHAT_ID` is required for autonomous and multi-agent notification mode.
-- For direct chat ID discovery, send `/start` to your bot first, then inspect updates:
-```bash
-curl "https://api.telegram.org/bot<TELEGRAM_TOKEN>/getUpdates"
-```
-
-## Run
-Main demo:
-```bash
-npm start
-```
-
-Telegram wallet bot:
+4. Run one of the runtimes:
 ```bash
 npx ts-node src/telegram/bot.ts
 ```
-
-Autonomous agent:
+```bash
+npx ts-node src/agent/multiAgent.ts
+```
 ```bash
 npx ts-node src/agent/autonomous.ts
 ```
 
-Multi-agent simulation:
-```bash
-npx ts-node src/agent/multiAgent.ts
-```
+## Environment Variables (Summary)
+Required core:
+- `TELEGRAM_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `GEMINI_API_KEY` (if Gemini-enabled paths are used)
+- `GROQ_API_KEY` (if Groq-enabled paths are used)
+- `MISTRAL_API_KEY` (if Mistral-enabled paths are used)
 
-## Render Web Service (Webhook Mode)
-For low-cost hosting, run the multi-agent bot in webhook mode.
+Common controls:
+- `MULTI_AGENT_AI_ENABLED`
+- `MULTI_AGENT_AIRDROP_ENABLED`
+- `AUTONOMOUS_AI_ENABLED`
+- `AUTONOMOUS_AIRDROP_ENABLED`
+- `MULTI_AGENT_REPORT_ON_START`
+- `TELEGRAM_USE_WEBHOOK`
+- `TELEGRAM_WEBHOOK_URL`
+- `TELEGRAM_WEBHOOK_PATH`
 
-Set these env vars on Render:
+## Render Deployment
+### Recommended (Web Service + Webhook Mode)
+Service config:
+- Build Command: `npm install && npm run build`
+- Start Command: `node dist/agent/multiAgent.js`
+
+Set env:
 ```env
 TELEGRAM_USE_WEBHOOK=true
 TELEGRAM_WEBHOOK_URL=https://<your-service>.onrender.com
@@ -75,16 +146,13 @@ TELEGRAM_WEBHOOK_PATH=/telegram/webhook
 PORT=10000
 ```
 
-Render service settings:
-```text
-Type: Web Service
-Build Command: npm install && npm run build
-Start Command: node dist/agent/multiAgent.js
+Then register/verify Telegram webhook:
+```bash
+https://api.telegram.org/bot<TELEGRAM_TOKEN>/setWebhook?url=https://<your-service>.onrender.com/telegram/webhook
 ```
-
-Notes:
-- Keep `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, and AI keys in Render env only.
-- If you run locally, set `TELEGRAM_USE_WEBHOOK=false` to use polling.
+```bash
+https://api.telegram.org/bot<TELEGRAM_TOKEN>/getWebhookInfo
+```
 
 ## Build and Test
 ```bash
@@ -92,27 +160,10 @@ npm run build
 npm test
 ```
 
-## Security
-- Never commit `.env`.
-- `.env` is ignored by git; only `.env.example` should be tracked.
-- If any secret was ever committed, rotate it immediately (Gemini key, Telegram token).
-
-## Project Structure
-```text
-src/
-  agent/
-    WalletAgent.ts
-    autonomous.ts
-    multiAgent.ts
-  telegram/
-    bot.ts
-  wallet/
-    AgenticWallet.ts
-  dapp/
-    TestDApp.ts
-  index.ts
-tests/
-```
+## Notes for Judges
+- This is intentionally built and tested on **Devnet**.
+- The system is designed as a realistic prototype: autonomous behavior + guardrails + observability.
+- It demonstrates core agentic wallet primitives expected for production-oriented architecture, while remaining transparent about devnet constraints.
 
 ## License
 MIT

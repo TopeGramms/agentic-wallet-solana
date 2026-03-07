@@ -1,78 +1,110 @@
-# SKILLS.md — Agentic Wallet for AI Agents
+﻿# SKILLS.md - Agent Capability Manifest
 
-> This file is intended for AI agents to understand how to interact with this wallet system.
+This document defines what AI agents can do in this Solana Devnet agentic wallet system and how they should interact with it.
 
-## Overview
-This is an **agentic wallet** built on Solana (devnet) that allows AI agents to autonomously manage crypto assets, sign transactions, and interact with DeFi protocols.
+## System Identity
+- Project: `agentic-wallet-solana`
+- Network: Solana Devnet
+- Runtime: TypeScript/Node.js
+- Interface: Telegram bot + scheduled autonomous loops
+- Goal: autonomous wallet monitoring and low-risk devnet operations
 
----
+## Core Capabilities
+The system supports agentic wallet behavior across three independent agents:
+- `Agent-Alpha` (`Gemini`) - maintain wallet balance above target threshold.
+- `Agent-Beta` (`Groq`) - monitor wallet and report status every cycle.
+- `Agent-Gamma` (`Mistral`) - act only when balance drops below low threshold.
 
-## Available Tools / Actions
+Each agent:
+- Creates/owns an isolated wallet (`Keypair.generate()` or configured key).
+- Reads wallet balance from Solana Devnet.
+- Makes autonomous decisions with rules-first logic and AI fallback.
+- Executes actions and reports outcomes to Telegram.
 
-### 1. `get_balance`
-Returns the current SOL balance of the wallet.
-- **Input**: none
-- **Output**: `{ balance: number }` in SOL
+## Supported Agent Decisions
+Agents must return one of these actions:
+- `REQUEST_AIRDROP`
+- `HOLD`
+- `LOG_STATUS`
 
-### 2. `send_sol`
-Sends SOL to another wallet address.
-- **Input**: `{ to_address: string, amount: number }`
-- **Output**: `{ signature: string }`
-- **Note**: Requires sufficient balance + gas fees (~0.000005 SOL)
+Optional reasoning text should explain why the action was selected.
 
-### 3. `request_airdrop`
-Requests a devnet airdrop. **Devnet only.**
-- **Input**: `{ amount?: number }` (default: 1 SOL, max: 2 SOL)
-- **Output**: `{ signature: string }`
+## Wallet Operations Available
+Wallet operations are separated from agent reasoning and should be called via wallet classes/modules:
+- `create_wallet` - create a new keypair wallet.
+- `get_wallet_address` - return public key.
+- `get_balance` - return SOL balance.
+- `request_airdrop` - request devnet SOL (subject to faucet limits and cooldown logic).
+- `send_sol` - transfer SOL and return signature.
 
-### 4. `get_wallet_info`
-Returns full wallet metadata.
-- **Input**: none
-- **Output**: `{ publicKey: string, balance: number }`
+## Telegram Command Surface
+Human-triggered bot commands:
+- `/alpha` - run/report Alpha agent state.
+- `/beta` - run/report Beta agent state.
+- `/gamma` - run/report Gamma agent state.
+- `/status` - show multi-agent summary.
+- `/report` - force full report cycle now.
 
-### 5. `get_spl_token_balance`
-Gets the balance of an SPL token.
-- **Input**: `{ mint_address: string }`
-- **Output**: `{ balance: number }`
+Autonomous behavior:
+- Scheduled reports at 8am and 8pm.
+- Optional interval-based cycles in autonomous and multi-agent runtimes.
 
-### 6. `send_spl_token`
-Transfers SPL tokens to another address.
-- **Input**: `{ mint_address: string, to_address: string, amount: number }`
-- **Output**: `{ signature: string }`
+## Agent Interaction Contract
+When an AI model is used for decisioning, the expected output format is:
 
----
-
-## Security Constraints
-- This wallet operates on **Solana Devnet only**
-- Private keys are stored in `.env` and never exposed in responses
-- The agent should always verify the recipient address before sending
-- Maximum single transaction: 1 SOL (configurable)
-- All transactions are logged with timestamps
-
----
-
-## How to Invoke This Agent
-
-```typescript
-import { runWalletAgent } from "./src/agent/WalletAgent";
-import { AgenticWallet } from "./src/wallet/AgenticWallet";
-
-const wallet = AgenticWallet.fromPrivateKey(process.env.WALLET_PRIVATE_KEY!);
-const result = await runWalletAgent("Send 0.1 SOL to <address>", wallet);
+```json
+{
+  "action": "REQUEST_AIRDROP | HOLD | LOG_STATUS",
+  "reasoning": "short explanation"
+}
 ```
 
----
+Execution flow:
+1. Load agent context (wallet address, current balance, thresholds, cooldown state).
+2. Apply deterministic rules first.
+3. If rules are inconclusive and AI is enabled, call provider model.
+4. Validate action against allowed enum.
+5. Execute wallet action if required.
+6. Post result and reasoning to Telegram.
 
-## Environment Variables Required
-```
-ANTHROPIC_API_KEY=your_anthropic_api_key
-WALLET_PRIVATE_KEY=your_wallet_private_key (base58 encoded)
-```
+## Security and Key Handling Rules
+- Never hardcode API keys or private keys in source files.
+- Keep `.env` out of git; commit only `.env.example`.
+- Treat all private keys as secrets even on devnet.
+- Validate destination addresses before transfers.
+- Respect faucet cooldown/backoff and action limits.
+- Log decisions and transaction signatures for auditability.
 
----
+## Required Environment Variables
+Minimum runtime secrets/config:
+- `TELEGRAM_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `GEMINI_API_KEY`
+- `GROQ_API_KEY`
+- `MISTRAL_API_KEY`
 
-## Network
-- **Chain**: Solana
-- **Network**: Devnet
-- **RPC**: https://api.devnet.solana.com
-- **Explorer**: https://explorer.solana.com?cluster=devnet
+Common feature flags:
+- `MULTI_AGENT_AI_ENABLED`
+- `AUTONOMOUS_AI_ENABLED`
+- `MULTI_AGENT_AIRDROP_ENABLED`
+- `AUTONOMOUS_AIRDROP_ENABLED`
+- `MULTI_AGENT_CYCLES`
+
+Webhook deployment (Render web service mode):
+- `TELEGRAM_USE_WEBHOOK`
+- `TELEGRAM_WEBHOOK_URL`
+- `TELEGRAM_WEBHOOK_PATH`
+- `PORT`
+
+## File Map for Agents and Integrators
+- `src/wallet/AgenticWallet.ts` - wallet primitives and transaction operations.
+- `src/agent/WalletAgent.ts` - wallet-agent execution bridge.
+- `src/agent/multiAgent.ts` - three-agent orchestration, provider routing, Telegram command handling.
+- `src/agent/autonomous.ts` - standalone autonomous runtime.
+- `src/dapp/TestDApp.ts` - test protocol/dApp interaction example.
+- `src/telegram/bot.ts` - Telegram conversational bot runtime.
+
+## Operational Constraints
+- Devnet-only prototype for bounty demonstration.
+- Faucet reliability/rate limits can temporarily block airdrops.
+- AI providers may rate-limit on free tiers; decision flow must remain functional with rules-only fallback.
