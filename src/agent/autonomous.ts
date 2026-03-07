@@ -7,6 +7,7 @@ dotenv.config();
 
 // ----- Types -----
 type AgentAction = "REQUEST_AIRDROP" | "HOLD" | "LOG_STATUS";
+type DecisionSource = "RULES" | "AI" | "CACHE";
 
 type Decision = {
   action: AgentAction;
@@ -18,10 +19,19 @@ type RuntimeConfig = {
   telegramChatId: string;
   geminiApiKey: string;
   geminiModel: string;
+  checkIntervalMs: number;
+  lowBalanceSol: number;
+  healthyBalanceSol: number;
+  logStatusEveryCycles: number;
+  airdropEnabled: boolean;
+  airdropCooldownMs: number;
+  aiMinIntervalMs: number;
+  aiMinBalanceDeltaSol: number;
+  aiEnabled: boolean;
+  aiMaxCallsPerRun: number;
 };
 
-// ----- Runtime Config -----
-const CHECK_INTERVAL_MS = 5 * 60 * 1000;
+// ----- Runtime Defaults -----
 const AIRDROP_SOL = 1;
 const MODEL_FALLBACKS = [
   "gemini-2.5-flash-lite",
@@ -30,7 +40,7 @@ const MODEL_FALLBACKS = [
   "gemini-flash-latest",
 ];
 
-// ----- Environment -----
+// ----- Environment Helpers -----
 function getEnv(...names: string[]): string | undefined {
   for (const name of names) {
     const value = process.env[name];
@@ -43,16 +53,38 @@ function cleanChatId(chatId: string): string {
   return chatId.replace(/^['"]|['"]$/g, "").trim();
 }
 
+function parseEnvNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseEnvInteger(name: string, fallback: number): number {
+  return Math.floor(parseEnvNumber(name, fallback));
+}
+
+function parseEnvBoolean(name: string, fallback: boolean): boolean {
+  const raw = getEnv(name);
+  if (!raw) return fallback;
+  const normalized = raw.toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
 function loadRuntimeConfig(): RuntimeConfig {
   const telegramToken = getEnv("TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN");
   const telegramChatIdRaw = getEnv("TELEGRAM_CHAT_ID");
   const geminiApiKey = getEnv("GEMINI_API_KEY");
   const geminiModel = getEnv("GEMINI_MODEL") || "gemini-2.5-flash-lite";
+  const aiEnabled = parseEnvBoolean("AUTONOMOUS_AI_ENABLED", true);
+  const aiMaxCallsPerRun = Math.max(0, parseEnvInteger("AUTONOMOUS_AI_MAX_CALLS_PER_RUN", 10));
 
   const missing: string[] = [];
   if (!telegramToken) missing.push("TELEGRAM_TOKEN (or TELEGRAM_BOT_TOKEN)");
   if (!telegramChatIdRaw) missing.push("TELEGRAM_CHAT_ID");
-  if (!geminiApiKey) missing.push("GEMINI_API_KEY");
+  if (aiEnabled && aiMaxCallsPerRun > 0 && !geminiApiKey) missing.push("GEMINI_API_KEY");
 
   if (missing.length > 0) {
     throw new Error(
@@ -61,15 +93,21 @@ function loadRuntimeConfig(): RuntimeConfig {
     );
   }
 
-  const safeTelegramToken = telegramToken as string;
-  const safeTelegramChatIdRaw = telegramChatIdRaw as string;
-  const safeGeminiApiKey = geminiApiKey as string;
-
   return {
-    telegramToken: safeTelegramToken,
-    telegramChatId: cleanChatId(safeTelegramChatIdRaw),
-    geminiApiKey: safeGeminiApiKey,
+    telegramToken: telegramToken as string,
+    telegramChatId: cleanChatId(telegramChatIdRaw as string),
+    geminiApiKey: geminiApiKey || "",
     geminiModel,
+    checkIntervalMs: parseEnvNumber("AUTONOMOUS_CHECK_INTERVAL_MINUTES", 15) * 60 * 1000,
+    lowBalanceSol: parseEnvNumber("AUTONOMOUS_LOW_BALANCE_SOL", 0.8),
+    healthyBalanceSol: parseEnvNumber("AUTONOMOUS_HEALTHY_BALANCE_SOL", 1.2),
+    logStatusEveryCycles: parseEnvNumber("AUTONOMOUS_LOG_STATUS_EVERY_CYCLES", 4),
+    airdropEnabled: parseEnvBoolean("AUTONOMOUS_AIRDROP_ENABLED", true),
+    airdropCooldownMs: parseEnvNumber("AUTONOMOUS_AIRDROP_COOLDOWN_MINUTES", 60) * 60 * 1000,
+    aiMinIntervalMs: parseEnvNumber("AUTONOMOUS_AI_MIN_INTERVAL_MINUTES", 30) * 60 * 1000,
+    aiMinBalanceDeltaSol: parseEnvNumber("AUTONOMOUS_AI_MIN_BALANCE_DELTA_SOL", 0.25),
+    aiEnabled,
+    aiMaxCallsPerRun,
   };
 }
 
@@ -117,9 +155,7 @@ async function resolveModel(
         msg.includes("not supported") ||
         msg.includes("quota") ||
         msg.includes("429");
-      if (!nonFatalModelError) {
-        throw error;
-      }
+      if (!nonFatalModelError) throw error;
     }
   }
 
@@ -164,6 +200,55 @@ function parseDecision(text: string): Decision {
   };
 }
 
+function getRuleBasedDecision(
+  balanceSol: number,
+  cycle: number,
+  lastAirdropAtMs: number,
+  config: RuntimeConfig
+): Decision | null {
+  const now = Date.now();
+
+  if (balanceSol < config.lowBalanceSol) {
+    if (now - lastAirdropAtMs >= config.airdropCooldownMs) {
+      return {
+        action: "REQUEST_AIRDROP",
+        reasoning: `Balance (${balanceSol.toFixed(4)} SOL) is below ${config.lowBalanceSol} SOL.`,
+      };
+    }
+    return {
+      action: "HOLD",
+      reasoning: "Balance is low but airdrop was requested recently. Cooling down.",
+    };
+  }
+
+  if (balanceSol >= config.healthyBalanceSol) {
+    if (cycle % config.logStatusEveryCycles === 0) {
+      return {
+        action: "LOG_STATUS",
+        reasoning: `Balance is healthy (${balanceSol.toFixed(4)} SOL). Periodic status log.`,
+      };
+    }
+    return {
+      action: "HOLD",
+      reasoning: `Balance is healthy (${balanceSol.toFixed(4)} SOL).`,
+    };
+  }
+
+  return null;
+}
+
+function shouldReuseAiDecision(
+  balanceSol: number,
+  lastAiAtMs: number,
+  lastAiBalanceSol: number | null,
+  config: RuntimeConfig
+): boolean {
+  if (!lastAiAtMs || lastAiBalanceSol === null) return false;
+  const recent = Date.now() - lastAiAtMs < config.aiMinIntervalMs;
+  const smallDelta = Math.abs(balanceSol - lastAiBalanceSol) < config.aiMinBalanceDeltaSol;
+  return recent && smallDelta;
+}
+
 async function decideNextAction(
   model: GenerativeModel,
   walletAddress: string,
@@ -184,7 +269,10 @@ async function decideNextAction(
     'Return JSON only: {"action":"REQUEST_AIRDROP|HOLD|LOG_STATUS","reasoning":"..."}',
   ].join("\n");
 
-  const result = await model.generateContent(prompt);
+  const result = await model.generateContent({
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { maxOutputTokens: 100, temperature: 0.1 },
+  });
   return parseDecision(result.response.text().trim());
 }
 
@@ -193,16 +281,24 @@ async function executeDecision(
   connection: Connection,
   wallet: Keypair,
   action: AgentAction,
-  balanceSol: number
+  balanceSol: number,
+  airdropEnabled: boolean
 ): Promise<string> {
   switch (action) {
     case "REQUEST_AIRDROP": {
-      const signature = await connection.requestAirdrop(
-        wallet.publicKey,
-        AIRDROP_SOL * LAMPORTS_PER_SOL
-      );
-      await connection.confirmTransaction(signature, "confirmed");
-      return `Requested ${AIRDROP_SOL} SOL airdrop. Tx: ${signature}`;
+      if (!airdropEnabled) {
+        return "Airdrop disabled by config. Holding.";
+      }
+      try {
+        const signature = await connection.requestAirdrop(
+          wallet.publicKey,
+          AIRDROP_SOL * LAMPORTS_PER_SOL
+        );
+        await connection.confirmTransaction(signature, "confirmed");
+        return `Requested ${AIRDROP_SOL} SOL airdrop. Tx: ${signature}`;
+      } catch (error) {
+        return `Airdrop failed: ${(error as Error).message}`;
+      }
     }
     case "LOG_STATUS":
       return `Status logged. Current balance: ${balanceSol} SOL`;
@@ -225,10 +321,20 @@ async function runAutonomousAgent(): Promise<void> {
   const bot = new TelegramBot(config.telegramToken, { polling: false });
   const actionHistory: string[] = [];
 
-  const { model, activeModelName } = await resolveModel(
-    config.geminiApiKey,
-    config.geminiModel
-  );
+  let aiCallCount = 0;
+  let lastAirdropAtMs = 0;
+  let lastAiAtMs = 0;
+  let lastAiBalanceSol: number | null = null;
+  let cachedAiDecision: Decision | null = null;
+
+  let model: GenerativeModel | null = null;
+  let activeModelName = "disabled";
+
+  if (config.aiEnabled && config.aiMaxCallsPerRun > 0) {
+    const resolved = await resolveModel(config.geminiApiKey, config.geminiModel);
+    model = resolved.model;
+    activeModelName = resolved.activeModelName;
+  }
 
   await notifyTelegram(
     bot,
@@ -237,8 +343,12 @@ async function runAutonomousAgent(): Promise<void> {
       "Autonomous wallet agent started.",
       `Wallet: ${wallet.publicKey.toBase58()}`,
       "Network: Solana Devnet",
-      `Check interval: ${CHECK_INTERVAL_MS / 60000} minutes`,
+      `Check interval: ${Math.round(config.checkIntervalMs / 60000)} minutes`,
       `Model: ${activeModelName}`,
+      "Decision mode: rules-first with AI fallback",
+      `Airdrop enabled: ${config.airdropEnabled ? "yes" : "no"}`,
+      `AI enabled: ${config.aiEnabled ? "yes" : "no"}`,
+      `AI max calls per run: ${config.aiMaxCallsPerRun}`,
     ].join("\n")
   );
 
@@ -249,18 +359,53 @@ async function runAutonomousAgent(): Promise<void> {
 
       const lamports = await connection.getBalance(wallet.publicKey, "confirmed");
       const balanceSol = lamports / LAMPORTS_PER_SOL;
-      const decision = await decideNextAction(
-        model,
-        wallet.publicKey.toBase58(),
+
+      let decisionSource: DecisionSource = "RULES";
+      let decision = getRuleBasedDecision(balanceSol, cycle, lastAirdropAtMs, config);
+
+      if (!decision) {
+        if (shouldReuseAiDecision(balanceSol, lastAiAtMs, lastAiBalanceSol, config) && cachedAiDecision) {
+          decisionSource = "CACHE";
+          decision = {
+            action: cachedAiDecision.action,
+            reasoning: `${cachedAiDecision.reasoning} (reused to save API quota)`,
+          };
+        } else if (model && config.aiEnabled && aiCallCount < config.aiMaxCallsPerRun) {
+          decisionSource = "AI";
+          decision = await decideNextAction(
+            model,
+            wallet.publicKey.toBase58(),
+            balanceSol,
+            actionHistory
+          );
+          aiCallCount += 1;
+          lastAiAtMs = Date.now();
+          lastAiBalanceSol = balanceSol;
+          cachedAiDecision = decision;
+        } else {
+          decisionSource = "RULES";
+          decision = {
+            action: "HOLD",
+            reasoning: "AI disabled or AI call budget exhausted. Holding for safety.",
+          };
+        }
+      }
+
+      const result = await executeDecision(
+        connection,
+        wallet,
+        decision.action,
         balanceSol,
-        actionHistory
+        config.airdropEnabled
       );
-      const result = await executeDecision(connection, wallet, decision.action, balanceSol);
+      if (decision.action === "REQUEST_AIRDROP" && !result.startsWith("Airdrop failed")) {
+        lastAirdropAtMs = Date.now();
+      }
 
       const updatedLamports = await connection.getBalance(wallet.publicKey, "confirmed");
       const updatedBalanceSol = updatedLamports / LAMPORTS_PER_SOL;
 
-      const historyEntry = `${new Date().toISOString()} | ${decision.action} | ${decision.reasoning}`;
+      const historyEntry = `${new Date().toISOString()} | ${decisionSource} | ${decision.action} | ${decision.reasoning}`;
       actionHistory.push(historyEntry);
       if (actionHistory.length > 25) actionHistory.shift();
 
@@ -269,10 +414,13 @@ async function runAutonomousAgent(): Promise<void> {
         config.telegramChatId,
         [
           `Cycle #${cycle}`,
+          `Source: ${decisionSource}`,
           `Decision: ${decision.action}`,
           `Reasoning: ${decision.reasoning}`,
           `Result: ${result}`,
           `Balance: ${updatedBalanceSol} SOL`,
+          `AI calls so far: ${aiCallCount}`,
+          `AI budget remaining: ${Math.max(0, config.aiMaxCallsPerRun - aiCallCount)}`,
         ].join("\n")
       );
     } catch (error) {
@@ -283,7 +431,7 @@ async function runAutonomousAgent(): Promise<void> {
       );
     }
 
-    await sleep(CHECK_INTERVAL_MS);
+    await sleep(config.checkIntervalMs);
   }
 }
 
