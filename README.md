@@ -79,8 +79,7 @@ For judging/demo, this gives:
 
 ![image](https://github.com/user-attachments/assets/6dc1fc05-d970-4ba2-bde8-731d55c65c54)
 
-
-
+![image](https://github.com/user-attachments/assets/44763d2c-77e5-428b-955a-61aaba1fd9c9)
 
 ## Core Files
 - `src/wallet/AgenticWallet.ts` (`agenticWallet.ts` in bounty wording)
