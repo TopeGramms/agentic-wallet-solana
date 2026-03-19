@@ -72,7 +72,7 @@ For judging/demo, this gives:
 - autonomous wallet behavior,
 - independent multi-agent state,
 - and real-time Telegram observability.
-## Screenshots 
+## Screenshots & Video
 <img width="828" height="1792" alt="image" src="https://github.com/user-attachments/assets/adf61617-7744-4f91-af2c-217fc8d204f5" />
 
 <img width="828" height="1792" alt="image" src="https://github.com/user-attachments/assets/b720e5fd-9990-4ff1-ba4a-6e82c917b926" />
@@ -81,6 +81,7 @@ For judging/demo, this gives:
 
 ![image](https://github.com/user-attachments/assets/44763d2c-77e5-428b-955a-61aaba1fd9c9)
 
+https://www.loom.com/share/b1066894b9bd4faf9eaa82d696b4a250
 ## Core Files
 - `src/wallet/AgenticWallet.ts` (`agenticWallet.ts` in bounty wording)
 - `src/agent/WalletAgent.ts` (`walletAgent.ts`)
